@@ -1,5 +1,6 @@
 # Redgate Monitor Port Validator Tool
 
+# --- Introduction ---
 Write-Host "==============================================" -ForegroundColor Yellow
 Write-Host "     Redgate Monitor Port Validator Tool" -ForegroundColor Cyan
 Write-Host "==============================================" -ForegroundColor Yellow
@@ -20,7 +21,6 @@ Write-Host ""
 Write-Host "✅ Based on your answers, the script will test the appropriate default ports" -ForegroundColor White
 Write-Host "   and generate a report showing which ports are open or blocked." -ForegroundColor White
 Write-Host ""
-
 
 # --- RDBMS Selection ---
 Write-Host "`nSelect the RDBMS you are monitoring:"
@@ -47,8 +47,51 @@ switch ($rdbmsChoice) {
 Write-Host "`nSelected RDBMS: $rdbmsName (Port $rdbmsPort)" -ForegroundColor Cyan
 
 # --- Server Input ---
-$servers = Read-Host "Enter target server names or IPs (comma-separated)"
-$serverList = $servers -split "," | ForEach-Object { $_.Trim() }
+Write-Host "`nHow would you like to provide the list of target servers?"
+Write-Host "1 = Manually enter server names"
+Write-Host "2 = Load from a CSV file (must contain a column named 'ServerName')"
+$serverInputMethod = Read-Host "Enter 1 or 2"
+
+switch ($serverInputMethod) {
+    '1' {
+        $servers = Read-Host "Enter target server names or IPs (comma-separated)"
+        $serverList = $servers -split "," | ForEach-Object { $_.Trim() }
+    }
+    '2' {
+        $validCsv = $false
+        while (-not $validCsv) {
+            $csvPath = Read-Host "Enter the full path to the CSV file"
+            $csvPath = $csvPath.Trim('"')  # Remove quotes if present
+            if (Test-Path $csvPath) {
+                try {
+                    $csvData = Import-Csv -Path $csvPath
+                    if ($csvData[0].PSObject.Properties.Name -contains "ServerName") {
+                        $serverList = $csvData | ForEach-Object { $_.ServerName.Trim() }
+                        $validCsv = $true
+                    } else {
+                        Write-Host "❌ CSV file must contain a column named 'ServerName'." -ForegroundColor Red
+                        exit
+                    }
+                } catch {
+                    Write-Host "❌ Failed to read CSV file: $($_.Exception.Message)" -ForegroundColor Red
+                    exit
+                }
+            } else {
+                Write-Host "❌ File not found: $csvPath" -ForegroundColor Red
+                $tryAgain = Read-Host "Would you like to try another path? (Y/N)"
+                if ($tryAgain -notin @('Y','y')) {
+                    Write-Host "Exiting script." -ForegroundColor Yellow
+                    exit
+                }
+            }
+        }
+    }
+    default {
+        Write-Host "Invalid selection. Exiting." -ForegroundColor Red
+        exit
+    }
+}
+
 
 # --- OS Selection ---
 Write-Host "`nWhat operating system are the target servers running?"
@@ -56,17 +99,15 @@ Write-Host "1 = Windows"
 Write-Host "2 = Linux"
 $osChoice = Read-Host "Enter 1 or 2"
 
-
 switch ($osChoice) {
-    '1' { $targetIsLinux = $false; $osName = "Windows" }
-    '2' { $targetIsLinux = $true;  $osName = "Linux" }
-    default {
-        Write-Host "Invalid selection. Defaulting to Windows." -ForegroundColor Yellow
-        $targetIsLinux = $false
-        $osName = "Windows"
-    }
+    '1' { $targetIsLinux = $false; $osName = "Windows" }
+    '2' { $targetIsLinux = $true;  $osName = "Linux" }
+    default {
+        Write-Host "Invalid selection. Defaulting to Windows." -ForegroundColor Yellow
+        $targetIsLinux = $false
+        $osName = "Windows"
+    }
 }
-
 
 Write-Host "`nTarget OS: $osName" -ForegroundColor Cyan
 
@@ -80,12 +121,12 @@ $method = Read-Host "Enter 1, 2, or 3"
 switch ($method) {
     '1' {
         $defaultPorts = @(5985, $rdbmsPort)
-        if ($isLinux) { $defaultPorts += 22 }
+        if ($targetIsLinux) { $defaultPorts += 22 }
         $methodName = "WinRM HTTP"
     }
     '2' {
         $defaultPorts = @(5986, $rdbmsPort)
-        if ($isLinux) { $defaultPorts += 22 }
+        if ($targetIsLinux) { $defaultPorts += 22 }
         $methodName = "WinRM HTTPS"
     }
     '3' {
@@ -95,13 +136,13 @@ switch ($method) {
             $staticDcomPort = 5000
         }
         $defaultPorts = @(135, [int]$staticDcomPort, $rdbmsPort)
-        if ($isLinux) { $defaultPorts += 22 }
+        if ($targetIsLinux) { $defaultPorts += 22 }
         $methodName = "WMI over DCOM"
     }
     default {
         Write-Host "Invalid selection. Defaulting to WinRM HTTP (5985)." -ForegroundColor Yellow
         $defaultPorts = @(5985, $rdbmsPort)
-        if ($isLinux) { $defaultPorts += 22 }
+        if ($targetIsLinux) { $defaultPorts += 22 }
         $methodName = "WinRM HTTP"
     }
 }
@@ -128,20 +169,38 @@ $results = @()
 foreach ($server in $serverList) {
     foreach ($port in $allPorts) {
         Write-Host "`nTesting $server on port $port..." -ForegroundColor Cyan
-        $test = Test-NetConnection -ComputerName $server -Port $port -WarningAction SilentlyContinue
-        $status = if ($test.TcpTestSucceeded) { "Open" } else { "Closed/Blocked" }
+        try {
+            $test = Test-NetConnection -ComputerName $server -Port $port -WarningAction SilentlyContinue
+            if ($test.TcpTestSucceeded) {
+                $status = "Open"
+                $diagnosis = "Connection successful"
+            } elseif (-not $test.PingSucceeded) {
+                $status = "Unreachable"
+                $diagnosis = "Host unreachable or blocked ICMP"
+            } elseif (-not $test.RemoteAddress) {
+                $status = "DNS Failure"
+                $diagnosis = "DNS resolution failed"
+            } else {
+                $status = "Closed/Blocked"
+                $diagnosis = "Port likely blocked by firewall or service not listening"
+            }
+        } catch {
+            $status = "Error"
+            $diagnosis = $_.Exception.Message
+        }
 
         $color = if ($status -eq "Open") { "Green" } else { "Red" }
-        Write-Host ("{0}:{1} - {2}" -f $server, $port, $status) -ForegroundColor $color
+        Write-Host ("{0}:{1} - {2} ({3})" -f $server, $port, $status, $diagnosis) -ForegroundColor $color
 
         $results += [PSCustomObject]@{
             Timestamp = (Get-Date).ToString("s")
             Server    = $server
             Port      = $port
             Status    = $status
+            Diagnosis = $diagnosis
         }
 
-        Add-Content -Path $logFile -Value ("{0} - {1}:{2} - {3}" -f (Get-Date -Format 's'), $server, $port, $status)
+        Add-Content -Path $logFile -Value ("{0} - {1}:{2} - {3} - {4}" -f (Get-Date -Format 's'), $server, $port, $status, $diagnosis)
     }
 }
 
